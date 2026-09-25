@@ -1,0 +1,181 @@
+"""
+Camada de persistência da aplicação.
+
+Requisito 3: os dados são gravados em um arquivo de texto que funciona
+como base de dados (aqui, em formato JSON — que é texto puro e legível).
+
+Requisito 9: os ativos são mantidos em memória em estruturas do tipo
+dict (hash map), indexados por ID e por hostname, para otimizar buscas.
+
+Regras de integridade mantidas por esta camada:
+- o ID do ativo é único;
+- o hostname do ativo é único (sem diferenciar maiúsculas/minúsculas),
+  porque ele também é usado como chave de busca no dict.
+"""
+
+from __future__ import annotations  # garante compatibilidade com Python 3.8+
+
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from modelos import Ativo
+
+CAMINHO_ARQUIVO_PADRAO = "ativos_db.txt"
+
+
+class BancoDeDados:
+    def __init__(self, caminho: str = CAMINHO_ARQUIVO_PADRAO):
+        self.caminho = caminho
+        # Requisito 9: dicionários (hash map) para busca O(1) por ID e por hostname
+        self.ativos_por_id: Dict[int, Ativo] = {}
+        self.ativos_por_hostname: Dict[str, Ativo] = {}
+        # Fica True se a base estava ilegível e não foi possível guardar uma
+        # cópia dela; nesse caso NÃO gravamos nada por cima do arquivo original.
+        self._gravacao_bloqueada = False
+        self._carregar()
+
+    # ---------- Carga / gravação em arquivo ----------
+
+    def _carregar(self) -> None:
+        if not os.path.exists(self.caminho):
+            return
+        try:
+            with open(self.caminho, "r", encoding="utf-8") as arquivo:
+                conteudo = arquivo.read().strip()
+            if not conteudo:
+                return
+            dados = json.loads(conteudo)
+            # Primeiro converte e valida TUDO; só depois indexa. Assim, se um
+            # registro estiver ruim, não sobra uma base "pela metade" na memória.
+            ativos = [Ativo.from_dict(item) for item in dados]
+            self._validar_unicidade(ativos)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError) as erro:
+            self._isolar_base_ilegivel(erro)
+            return
+
+        for ativo in ativos:
+            self._indexar(ativo)
+
+    @staticmethod
+    def _validar_unicidade(ativos: List[Ativo]) -> None:
+        ids = set()
+        hostnames = set()
+        for ativo in ativos:
+            if not isinstance(ativo.id_ativo, int) or isinstance(ativo.id_ativo, bool):
+                raise ValueError(f"ID inválido no arquivo: {ativo.id_ativo!r}")
+            if ativo.id_ativo in ids:
+                raise ValueError(f"ID {ativo.id_ativo} repetido no arquivo")
+            chave = ativo.hostname.lower()
+            if chave in hostnames:
+                raise ValueError(f"hostname '{ativo.hostname}' repetido no arquivo")
+            ids.add(ativo.id_ativo)
+            hostnames.add(chave)
+
+    def _isolar_base_ilegivel(self, erro: Exception) -> None:
+        """
+        Em vez de descartar silenciosamente uma base que não pôde ser lida
+        (e depois sobrescrevê-la no próximo salvar()), renomeia o arquivo
+        para um backup com data/hora, preservando os dados originais.
+        """
+        carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destino = f"{self.caminho}.{carimbo}.bak"
+        try:
+            os.replace(self.caminho, destino)
+            print(
+                f"[Aviso] Não foi possível ler a base de dados ({erro}).\n"
+                f"        O arquivo original foi preservado em '{destino}'.\n"
+                "        O programa vai iniciar com uma base vazia."
+            )
+        except OSError as erro_arquivo:
+            self._gravacao_bloqueada = True
+            print(
+                f"[Aviso] Não foi possível ler a base de dados ({erro}) e também não foi "
+                f"possível criar um backup ({erro_arquivo}).\n"
+                "        Para não perder dados, as gravações ficam bloqueadas nesta execução."
+            )
+
+    def salvar(self) -> None:
+        if self._gravacao_bloqueada:
+            raise RuntimeError(
+                "gravação bloqueada: a base original está ilegível e sem backup. "
+                "Corrija ou mova o arquivo manualmente."
+            )
+        dados = [ativo.to_dict() for ativo in self.ativos_por_id.values()]
+        # Grava em um arquivo temporário e só então troca pelo definitivo:
+        # se o programa cair no meio da gravação, a base antiga continua intacta.
+        temporario = self.caminho + ".tmp"
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+        os.replace(temporario, self.caminho)
+
+    # ---------- Indexação (dict / hash map) ----------
+
+    def _indexar(self, ativo: Ativo) -> None:
+        self.ativos_por_id[ativo.id_ativo] = ativo
+        self.ativos_por_hostname[ativo.hostname.lower()] = ativo
+
+    # ---------- Consultas de existência ----------
+
+    def existe_id(self, id_ativo: int) -> bool:
+        return id_ativo in self.ativos_por_id
+
+    def existe_hostname(self, hostname: str, ignorar_id: Optional[int] = None) -> bool:
+        """
+        Diz se já existe um ativo com esse hostname. 'ignorar_id' serve para a
+        atualização: o próprio ativo pode manter o hostname que já tem.
+        """
+        ativo = self.ativos_por_hostname.get(hostname.lower())
+        return ativo is not None and ativo.id_ativo != ignorar_id
+
+    # ---------- Operações CRUD sobre a base ----------
+
+    def adicionar(self, ativo: Ativo) -> None:
+        # Segunda barreira (a primeira fica no menu): a própria base recusa
+        # duplicidades, para nunca corromper os índices.
+        if self.existe_id(ativo.id_ativo):
+            raise ValueError(f"já existe um ativo com o ID {ativo.id_ativo}")
+        if self.existe_hostname(ativo.hostname):
+            raise ValueError(f"já existe um ativo com o hostname '{ativo.hostname}'")
+        self._indexar(ativo)
+        self.salvar()
+
+    def buscar_por_id(self, id_ativo: int) -> Optional[Ativo]:
+        return self.ativos_por_id.get(id_ativo)
+
+    def buscar_por_hostname(self, hostname: str) -> Optional[Ativo]:
+        return self.ativos_por_hostname.get(hostname.lower())
+
+    def buscar_por_trecho_hostname(self, trecho: str) -> List[Ativo]:
+        """
+        Retorna todos os ativos cujo hostname contém 'trecho' (sem diferenciar
+        maiúsculas/minúsculas). É uma busca por varredura (não usa o dict como
+        chave direta), útil quando o usuário não lembra o hostname exato.
+        """
+        trecho = trecho.lower()
+        return [
+            ativo
+            for ativo in self.ativos_por_id.values()
+            if trecho in ativo.hostname.lower()
+        ]
+
+    def remover(self, id_ativo: int) -> Optional[Ativo]:
+        ativo = self.ativos_por_id.pop(id_ativo, None)
+        if ativo is not None:
+            # Remove também das vulnerabilidades associadas (Requisito 6):
+            # como a vulnerabilidade é um atributo do próprio objeto Ativo,
+            # ao remover o ativo do dicionário, suas vulnerabilidades saem junto.
+            self.ativos_por_hostname.pop(ativo.hostname.lower(), None)
+            self.salvar()
+        return ativo
+
+    def listar_todos(self) -> List[Ativo]:
+        return list(self.ativos_por_id.values())
+
+    def reindexar_apos_edicao(self, ativo: Ativo, hostname_antigo: str) -> None:
+        """Chamado após alterar o hostname de um ativo já indexado."""
+        if hostname_antigo.lower() != ativo.hostname.lower():
+            self.ativos_por_hostname.pop(hostname_antigo.lower(), None)
+            self.ativos_por_hostname[ativo.hostname.lower()] = ativo
+        self.salvar()
